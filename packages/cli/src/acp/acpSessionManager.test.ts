@@ -15,6 +15,7 @@ import {
   type Mocked,
 } from 'vitest';
 import { AcpSessionManager } from './acpSessionManager.js';
+import { Session } from './acpSession.js';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -465,6 +466,121 @@ describe('AcpSessionManager', () => {
 
     expect(response).toBeDefined();
     expect(mockConfig.getGeminiClient().resumeChat).toHaveBeenCalled();
+  });
+
+  it('should finish streaming history before loadSession resolves', async () => {
+    const testDir = await fs.mkdtemp(path.join(os.tmpdir(), 'acp-load-order-'));
+    const sessionId = 'test-session-load-order';
+    const storage = new Storage(testDir, sessionId);
+    await storage.initialize();
+    const chatsDir = path.join(storage.getProjectTempDir(), 'chats');
+    await fs.mkdir(chatsDir, { recursive: true });
+
+    const messages = [
+      {
+        id: 'msg-1',
+        timestamp: new Date().toISOString(),
+        type: 'user',
+        content: 'hello',
+      },
+      {
+        id: 'msg-2',
+        timestamp: new Date().toISOString(),
+        type: 'gemini',
+        content: 'world',
+      },
+    ];
+    const header = {
+      sessionId,
+      projectHash: 'test-hash',
+      startTime: new Date().toISOString(),
+      lastUpdated: new Date().toISOString(),
+      kind: 'main',
+    };
+    await fs.writeFile(
+      path.join(chatsDir, `session-2026-09-30-${sessionId.slice(0, 8)}.jsonl`),
+      JSON.stringify(header) +
+        '\n' +
+        messages.map((m) => JSON.stringify(m)).join('\n') +
+        '\n',
+    );
+
+    let resolveHistory!: () => void;
+    const historyDone = new Promise<void>((resolve) => {
+      resolveHistory = resolve;
+    });
+    const streamSpy = vi
+      .spyOn(Session.prototype, 'streamHistory')
+      .mockReturnValue(historyDone);
+
+    const loadPromise = manager.loadSession(
+      {
+        sessionId,
+        cwd: testDir,
+        mcpServers: [],
+      },
+      {},
+    );
+
+    const start = Date.now();
+    while (streamSpy.mock.calls.length === 0 && Date.now() - start < 5000) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(streamSpy).toHaveBeenCalledWith(messages);
+
+    let resolved = false;
+    void loadPromise.then(() => {
+      resolved = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(resolved).toBe(false);
+
+    resolveHistory();
+    await expect(loadPromise).resolves.toBeDefined();
+  });
+
+  it('should still load the session when streaming history fails', async () => {
+    const testDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'acp-load-history-error-'),
+    );
+    const sessionId = 'test-session-history-error';
+    const storage = new Storage(testDir, sessionId);
+    await storage.initialize();
+    const chatsDir = path.join(storage.getProjectTempDir(), 'chats');
+    await fs.mkdir(chatsDir, { recursive: true });
+
+    const header = {
+      sessionId,
+      projectHash: 'test-hash',
+      startTime: new Date().toISOString(),
+      lastUpdated: new Date().toISOString(),
+      kind: 'main',
+    };
+    const message = {
+      id: 'msg-1',
+      timestamp: new Date().toISOString(),
+      type: 'user',
+      content: 'hello',
+    };
+    await fs.writeFile(
+      path.join(chatsDir, `session-2026-09-30-${sessionId.slice(0, 8)}.jsonl`),
+      JSON.stringify(header) + '\n' + JSON.stringify(message) + '\n',
+    );
+
+    vi.spyOn(Session.prototype, 'streamHistory').mockRejectedValue(
+      new Error('replay failed'),
+    );
+
+    const response = await manager.loadSession(
+      {
+        sessionId,
+        cwd: testDir,
+        mcpServers: [],
+      },
+      {},
+    );
+
+    expect(response).toBeDefined();
   });
 
   it('should reject loading an invalid session identifier without leaking event listeners', async () => {

@@ -280,10 +280,13 @@ export class AcpSessionManager {
         },
       };
 
-      // Stream history back to client
-      session.streamHistory(messages).catch((err) => {
+      // Stream history back to the client before responding, so the
+      // replayed history arrives before the session/load response.
+      try {
+        await session.streamHistory(messages);
+      } catch (err) {
         debugLogger.error(`Error streaming history: ${err}`);
-      });
+      }
 
       setTimeout(() => {
         session?.sendAvailableCommands().catch((err) => {
